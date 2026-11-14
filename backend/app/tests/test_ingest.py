@@ -85,6 +85,19 @@ def test_incremental_lookback_backfill_and_conflict(temp_db):
     assert canon_repo.get_by_key(temp_db, "SKU-2001") is None
 
 
+def test_lookup_is_exact_key_only(temp_db):
+    """A key that only shares a prefix with a stored key must not see it.
+
+    Letting SKU-1001 resolve to SKU-10011 (or vice versa) would adjudicate one
+    business key against another's row and let "unique" keys overwrite each
+    other; the lookup must be exact.
+    """
+    assert canon_repo.get_by_key(temp_db, "SKU-1001")["business_key"] == "SKU-1001"
+    assert canon_repo.get_by_key(temp_db, "SKU-100") is None
+    assert canon_repo.get_by_key(temp_db, "SKU-10011") is None
+    assert canon_repo.get_by_key(temp_db, "sku-1001") is None
+
+
 def test_full_replay_keeps_conflict_and_skips_stale(temp_db):
     run_ingest(2, "incremental")
 

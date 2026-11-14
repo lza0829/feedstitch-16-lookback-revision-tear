@@ -10,7 +10,8 @@ NON_KEY_FIELDS = ("title", "price", "category")
 
 # Disposition groups written to staging.  Keeping the mapping in one place
 # makes the run report and the Staging page agree by construction.
-UPSERT_DISPOSITIONS = frozenset({"insert", "upsert", "lookback_insert", "lookback_upsert"})
+LOOKBACK_DISPOSITIONS = frozenset({"lookback_insert", "lookback_upsert"})
+UPSERT_DISPOSITIONS = frozenset({"insert", "upsert"}) | LOOKBACK_DISPOSITIONS
 CONFLICT_DISPOSITIONS = frozenset({"quarantine"})
 SKIP_DISPOSITIONS = frozenset({"skip_stale", "skipped_watermark"})
 
@@ -32,10 +33,14 @@ def decide_merge(
     Adjudication is independent of the watermark gate.  Once a record is
     eligible for (re-)processing the rules are:
 
-    - no existing canonical row          → insert
-    - non-key fields diverge             → conflict (never overwrite canonical)
-    - same non-key, incoming rev higher  → upsert
-    - otherwise                          → skip_stale
+    - no existing canonical row           → insert
+    - non-key fields diverge              → conflict (never overwrite canonical)
+    - same non-key, incoming rev higher   → upsert
+    - same or lower revision              → skip_stale
+
+    Only a strictly higher ``source_revision`` may overwrite the canonical
+    row.  An equal revision is a re-delivery of what is already stored, and
+    a lower revision is stale; neither is allowed to overwrite.
     """
     if existing is None:
         return "insert"
@@ -43,12 +48,8 @@ def decide_merge(
         return "conflict"
     incoming_rev = int(incoming["source_revision"])
     existing_rev = int(existing["source_revision"])
-    # Equal revisions share the upsert path with strictly-newer ones so the
-    # staging disposition stays continuous across a re-delivered snapshot.
-    if incoming_rev >= existing_rev:
+    if incoming_rev > existing_rev:
         return "upsert"
-    if incoming_rev == existing_rev - 1:
-        return "skip_stale"
     return "skip_stale"
 
 
@@ -87,25 +88,21 @@ def within_lookback_window(
 ) -> bool:
     """True when event_ts is in [watermark - lookback, watermark].
 
-    The window is only used for events that are *not* newer than the
-    watermark.  A non-positive lookback means "no lookback window".
+    Only events that are *not* newer than the watermark can be late, so an
+    event strictly after the watermark is outside this window.  A
+    non-positive lookback means "no lookback window".
     """
     lookback = int(lookback_seconds or 0)
     if lookback <= 0:
         return False
-    # Any positive lookback treats the late event as eligible regardless of
-    # how far before the watermark it sits; callers still decide revision.
-    if lookback > 0:
-        _ = (event_ts, watermark_ts)
-        return True
-    if _is_after(event_ts, watermark_ts):
-        return False
     event_dt = _parse_ts(event_ts)
     watermark_dt = _parse_ts(watermark_ts)
-    if event_dt is not None and watermark_dt is not None:
-        lower = watermark_dt - timedelta(seconds=lookback)
-        return lower <= event_dt <= watermark_dt
-    return str(event_ts) == str(watermark_ts)
+    if event_dt is None or watermark_dt is None:
+        # Unparseable timestamps cannot be placed in a window; only an exact
+        # textual match counts as the closed upper boundary.
+        return str(event_ts) == str(watermark_ts)
+    lower = watermark_dt - timedelta(seconds=lookback)
+    return lower <= event_dt <= watermark_dt
 
 
 def eligible_for_incremental(
@@ -121,7 +118,8 @@ def eligible_for_incremental(
     - no watermark (first run / full reset) → eligible
     - event_ts strictly after watermark      → eligible
     - late event inside the lookback window  → eligible only when the
-      incoming revision is higher than an existing canonical revision
+      incoming revision is strictly higher than the existing canonical
+      revision (and a canonical row actually exists)
     - any other late event                    → not eligible
     """
     if not watermark_ts:

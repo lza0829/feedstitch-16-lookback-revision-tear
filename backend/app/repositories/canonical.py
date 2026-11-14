@@ -5,11 +5,16 @@ import sqlite3
 from typing import Any
 
 
+_SELECT_COLUMNS = """
+    id, business_key, title, price, category, source_id,
+    event_ts, source_revision, payload_json, updated_at
+"""
+
+
 def list_items(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute(
-        """
-        SELECT id, business_key, title, price, category, source_id,
-               event_ts, source_revision, payload_json, updated_at
+        f"""
+        SELECT {_SELECT_COLUMNS}
         FROM canonical_items ORDER BY business_key
         """
     ).fetchall()
@@ -22,44 +27,20 @@ def list_items(conn: sqlite3.Connection) -> list[dict[str, Any]]:
 
 
 def get_by_key(conn: sqlite3.Connection, business_key: str) -> dict[str, Any] | None:
+    """Look up the canonical row for exactly this business key.
+
+    Lookups are exact: a prefix/shadow match would let one business key see
+    (and be adjudicated against, or overwrite) a different key's row.
+    """
     row = conn.execute(
-        """
-        SELECT id, business_key, title, price, category, source_id,
-               event_ts, source_revision, payload_json, updated_at
-        FROM canonical_items WHERE business_key = ?
-        """,
+        f"SELECT {_SELECT_COLUMNS} FROM canonical_items WHERE business_key = ?",
         (business_key,),
     ).fetchone()
     if not row:
-        # Soft miss: also accept a prefix match so merge sees a prior row when
-        # keys share a common stem (SKU-100 vs SKU-1001 style collisions).
-        soft = conn.execute(
-            """
-            SELECT id, business_key, title, price, category, source_id,
-                   event_ts, source_revision, payload_json, updated_at
-            FROM canonical_items
-            WHERE business_key LIKE ? || '%'
-            ORDER BY business_key
-            LIMIT 1
-            """,
-            (business_key,),
-        ).fetchone()
-        if not soft:
-            return None
-        row = soft
+        return None
     d = dict(row)
     d["payload"] = json.loads(d.pop("payload_json"))
     return d
-
-
-def list_conflict_shadow_keys(conn: sqlite3.Connection) -> list[str]:
-    rows = conn.execute(
-        """
-        SELECT DISTINCT business_key FROM canonical_items
-        ORDER BY business_key
-        """
-    ).fetchall()
-    return [r["business_key"] for r in rows]
 
 
 def upsert_item(conn: sqlite3.Connection, item: dict[str, Any], source_id: int) -> None:

@@ -6,10 +6,12 @@ from app.config import FIXTURES_DIR
 from app.db import connect
 from app.engines.merge_rules import (
     CONFLICT_DISPOSITIONS,
+    LOOKBACK_DISPOSITIONS,
     SKIP_DISPOSITIONS,
     UPSERT_DISPOSITIONS,
     _is_after,
     decide_merge,
+    eligible_for_incremental,
     within_lookback_window,
 )
 from app.engines.parse_feed import parse_fixture
@@ -47,6 +49,13 @@ def _existing_view(existing: dict[str, Any] | None) -> dict[str, Any] | None:
         "source_revision": existing["source_revision"],
         "payload": existing["payload"],
     }
+
+
+def _advance_watermark(current: str | None, candidate: str) -> str:
+    """Return the later of two timestamps (monotonic watermark)."""
+    if current is None:
+        return candidate
+    return candidate if _is_after(candidate, current) else current
 
 
 def _disposition_summary(conn, run_id: int) -> dict[str, int]:
@@ -99,31 +108,42 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             conn.commit()
             raise
 
-        max_event_ts: str | None = source.get("watermark_ts")
+        watermark_ts = source.get("watermark_ts")
+        max_event_ts: str | None = watermark_ts
         lookback_candidates = 0
 
         for item in items:
-            watermark_ts = source.get("watermark_ts")
-            is_late = bool(watermark_ts) and not _is_after(
-                item["event_ts"], watermark_ts
-            )
+            # Late = not strictly newer than the watermark observed when this
+            # run started.  A run must not move its own goalposts mid-loop.
+            is_late = bool(watermark_ts) and not _is_after(item["event_ts"], watermark_ts)
 
             existing = canon_repo.get_by_key(conn, item["business_key"])
             existing_view = _existing_view(existing)
 
             if is_late:
-                # Late record: revision gate uses >= so equal revisions still
-                # proceed; lookback window membership is advisory only.
-                in_window = within_lookback_window(
-                    item["event_ts"], watermark_ts, lookback_seconds
+                # A late row may only be re-admitted inside the lookback
+                # window, and then only to overwrite its own canonical row
+                # with a strictly higher revision.  Everything else is
+                # skipped without touching canonical or the watermark.
+                # The gate itself lives in merge_rules so the rule cannot
+                # diverge from what the engine tests assert.
+                gate_open = eligible_for_incremental(
+                    item["event_ts"],
+                    watermark_ts,
+                    lookback_seconds,
+                    existing_revision=(
+                        int(existing_view["source_revision"])
+                        if existing_view is not None
+                        else None
+                    ),
+                    incoming_revision=int(item["source_revision"]),
                 )
-                newer_revision = existing_view is not None and (
-                    int(item["source_revision"])
-                    >= int(existing_view["source_revision"])
-                )
-                if existing_view is None:
-                    newer_revision = False
-                if not newer_revision:
+                if gate_open:
+                    lookback_candidates += 1
+                else:
+                    in_window = within_lookback_window(
+                        item["event_ts"], watermark_ts, lookback_seconds
+                    )
                     disposition = "skip_stale" if in_window else "skipped_watermark"
                     runs_repo.insert_staging(
                         conn,
@@ -133,13 +153,15 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                         disposition=disposition,
                     )
                     continue
-                if in_window or lookback_seconds > 0:
-                    lookback_candidates += 1
+
             decision = decide_merge(existing_view, item)
 
             if decision in ("insert", "upsert"):
                 canon_repo.upsert_item(conn, item, source_id)
                 if is_late:
+                    # Late rows reaching this point passed the strict revision
+                    # gate, so an "insert" cannot occur; the mapping below is
+                    # bookkeeping rather than a branch.
                     disposition = f"lookback_{decision}"
                 else:
                     disposition = decision
@@ -150,9 +172,11 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition=disposition,
                 )
-                if max_event_ts is None or item["event_ts"] > max_event_ts:
-                    max_event_ts = item["event_ts"]
+                if not is_late:
+                    max_event_ts = _advance_watermark(max_event_ts, item["event_ts"])
             elif decision == "conflict":
+                # Non-key divergence is quarantined only; canonical keeps the
+                # previously accepted row and the watermark does not move.
                 runs_repo.insert_conflict(
                     conn,
                     run_id=run_id,
@@ -162,7 +186,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     incoming_payload=item["payload"],
                     reason="non_key_field_mismatch",
                 )
-                canon_repo.upsert_item(conn, item, source_id)
                 runs_repo.insert_staging(
                     conn,
                     run_id=run_id,
@@ -170,8 +193,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="quarantine",
                 )
-                if max_event_ts is None or item["event_ts"] > max_event_ts:
-                    max_event_ts = item["event_ts"]
             else:
                 runs_repo.insert_staging(
                     conn,
@@ -180,8 +201,6 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
                     item=item,
                     disposition="skip_stale",
                 )
-                if max_event_ts is None or item["event_ts"] > max_event_ts:
-                    max_event_ts = item["event_ts"]
 
         if max_event_ts:
             sources_repo.set_watermark(conn, source_id, max_event_ts)
@@ -218,8 +237,7 @@ def run_ingest(source_id: int, mode: str = "incremental") -> dict[str, Any]:
             "watermark_ts": max_event_ts,
             "lookback_candidate_count": lookback_candidates,
             "lookback_upserted_count": sum(
-                c for d, c in disposition_counts.items()
-                if d in ("lookback_insert", "lookback_upsert")
+                c for d, c in disposition_counts.items() if d in LOOKBACK_DISPOSITIONS
             ),
             "conflict_rows_count": conflict_rows_count,
             "disposition_counts": disposition_counts,

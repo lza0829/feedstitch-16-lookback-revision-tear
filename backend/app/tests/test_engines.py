@@ -60,6 +60,10 @@ def test_upsert_higher_revision_same_fields():
         "payload": {},
     }
     assert decide_merge(a, b) == "upsert"
+    # Equal revision is a re-delivery, not an upgrade.
+    assert decide_merge(a, {**b, "source_revision": 1}) == "skip_stale"
+    # A lower revision must never overwrite.
+    assert decide_merge(a, {**b, "source_revision": 0}) == "skip_stale"
 
 
 def test_insert_when_missing():

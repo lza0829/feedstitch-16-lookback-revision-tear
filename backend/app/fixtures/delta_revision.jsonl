@@ -1,0 +1,8 @@
+{"business_key":"SKU-R1","title":"Brass Hook","price":12.5,"category":"hardware","event_ts":"2026-11-05T09:00:00Z","source_revision":9}
+{"business_key":"SKU-R2","title":"Pine Crate","price":44.0,"category":"storage","event_ts":"2026-11-05T11:30:00Z","source_revision":5}
+{"business_key":"SKU-R3","title":"Cedar Bin","price":30.0,"category":"storage","event_ts":"2026-11-05T11:40:00Z","source_revision":3}
+{"business_key":"SKU-R4","title":"Glass Vase","price":69.0,"category":"decor","event_ts":"2026-11-05T11:45:00Z","source_revision":7}
+{"business_key":"SKU-R5","title":"Linen Runner","price":22.0,"category":"textile","event_ts":"2026-11-05T11:50:00Z","source_revision":2}
+{"business_key":"SKU-R6","title":"Wool Rug","price":135.0,"category":"textile","event_ts":"2026-11-05T12:10:00Z","source_revision":3}
+{"business_key":"SKU-R7","title":"Oak Stool","price":70.0,"category":"furniture","event_ts":"2026-11-05T12:20:00Z","source_revision":1}
+{"business_key":"SKU-R8","title":"Bamboo Box","price":35.0,"category":"storage","event_ts":"2026-11-05T12:05:00Z","source_revision":1}
